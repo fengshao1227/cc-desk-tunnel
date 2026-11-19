@@ -1,0 +1,24 @@
+[Unit]
+Description=CC Desk Tunnel server (native; shares @USER@'s Claude Code login and ~/.claude)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=@USER@
+Group=@USER@
+WorkingDirectory=@HOME@/.local/share/cc-desk-tunnel
+Environment=HOME=@HOME@
+Environment=PATH=@PATH@
+EnvironmentFile=-@HOME@/.config/cc-desk-tunnel/systemd.env
+ExecStart=@HOME@/opt/node24/bin/node --env-file=@HOME@/.config/cc-desk-tunnel/service.env @HOME@/apps/cc-desk-tunnel/current/apps/server/src/main.ts
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=30
+# MemoryLimit for systemd < 231 (CentOS 7); newer systemd reads MemoryMax and ignores this with a warning.
+MemoryLimit=1536M
+MemoryMax=1536M
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
