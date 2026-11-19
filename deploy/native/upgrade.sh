@@ -34,7 +34,7 @@ case $mode in
     for d in $(ls -1dt "$APP"/releases/*/ 2>/dev/null); do
       d=${d%/}; mark=' '; [ "$d" = "$current" ] && mark='*'
       printf '%s %s  %s  %s\n' "$mark" "$(basename "$d")" \
-        "$(as_user git -C "$d" log -1 --format='%ci %s' 2>/dev/null | cut -c1-70)" \
+        "$(cd "$d" && as_user git log -1 --format='%ci %s' 2>/dev/null | cut -c1-70)" \
         "$(as_user node -p "require('$d/apps/desktop/package.json').version" 2>/dev/null)"
     done
     exit ;;
