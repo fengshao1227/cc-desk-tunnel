@@ -21,7 +21,8 @@ sha=$(git ls-remote "$CCDT_REPO" "$ref" | head -1 | cut -c1-12); [ -n "$sha" ] |
 release=$APP/releases/$sha
 if [ ! -f "$release/apps/server/src/main.ts" ]; then
   log "source $ref ($sha)"
-  install -d -o "$CCDT_UID" -g "$CCDT_GID" "$APP/releases"
+  # Every level the service user writes into must be its own: install -d only owns the last component.
+  install -d -o "$CCDT_UID" -g "$CCDT_GID" "$CCDT_HOME/apps" "$APP" "$APP/releases"
   fetch_source "$ref" "$release"
 fi
 install_dependencies "$release" "$(readlink -f "$APP/current" 2>/dev/null || true)"
