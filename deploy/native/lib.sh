@@ -125,7 +125,7 @@ install_web() {  # <dir>
   local dir=$1 version tmp name
   [ -s "$dir/apps/server/web/index.html" ] && return
   version=$(as_user node -p "require('$dir/apps/desktop/package.json').version")
-  tmp=$(mktemp -d); name=cc-desk-tunnel-server-$version.tar.gz
+  tmp=$(mktemp -d); chmod 755 "$tmp"; name=cc-desk-tunnel-server-$version.tar.gz   # the service user copies from it
   if curl -fsSL --max-time 120 -o "$tmp/$name" "https://github.com/$UPSTREAM_REPO/releases/download/v$version/$name" \
      && curl -fsSL --max-time 60 -o "$tmp/SHA256SUMS" "https://github.com/$UPSTREAM_REPO/releases/download/v$version/SHA256SUMS" \
      && (cd "$tmp" && grep "  $name\$" SHA256SUMS | sha256sum -c - >/dev/null); then
