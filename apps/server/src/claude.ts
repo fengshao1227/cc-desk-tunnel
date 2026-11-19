@@ -4,6 +4,7 @@ import { query, getSessionInfo } from '@anthropic-ai/claude-agent-sdk';
 import type { Query, SDKSessionInfo, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import type { Effort, EventPayload, NativeMetrics, PermissionMode } from '@cc-desk-tunnel/protocol';
 import { deviceTerms } from './device-terms.ts';
+import { templateDevicePrompt } from './device-prompt.ts';
 import type { Execution } from './device-terms.ts';
 import { ClaudeStream } from './claude-stream.ts';
 import type { SshConnection } from './tunnel.ts';
@@ -116,6 +117,8 @@ export function sshPath(
 
 // `sessionId` is the proxy's name for the session, which a scheduled task needs to continue it.
 export function remotePrompt(projectPath: string, sessionId: string, execution: Execution) {
+  const custom = templateDevicePrompt(projectPath, sessionId, execution);
+  if (custom) return custom;
   const terms = deviceTerms(execution, projectPath);
   return [
     "The user's projects are on their own computer, the device, NOT on this Linux host, which only runs Claude Code and has no copy of them.",

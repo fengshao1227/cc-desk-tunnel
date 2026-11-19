@@ -93,6 +93,7 @@ import type { UpdateOptions } from './updates.ts';
 import { UsageLog, createUsageReceiver, telemetryEnvironment } from './usage.ts';
 import { WebAccess } from './web-access.ts';
 import { browserActivity, browserCommands, isWebCommand } from './web-commands.ts';
+import { effectivePermissionMode } from './permission-default.ts';
 
 type Peer = {
   socket: WebSocket;
@@ -687,7 +688,7 @@ export function createProxyServer(options: ServerOptions) {
         nativeRoot: session.nativeRoot ?? session.id,
         projectPath: said.projectPath,
         execution: said.execution,
-        permissionMode: session.permissionMode,
+        permissionMode: effectivePermissionMode(session.permissionMode),
         model: session.model,
         effort: session.effort,
         input: run.input!,

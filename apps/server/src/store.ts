@@ -14,6 +14,8 @@ import {
 import { deviceTerms, systemShell } from './device-terms.ts';
 import type { Execution } from './device-terms.ts';
 import { DomainError } from './errors.ts';
+import { defaultPermissionMode } from './permission-default.ts';
+import { linkProjectRoot } from './project-links.ts';
 import type {
   Device,
   DevicePlatform,
@@ -444,7 +446,7 @@ export class SessionStore {
       projectPath,
       device,
       nativeRoot: this.rootFor(device, projectPath),
-      permissionMode: 'auto',
+      permissionMode: defaultPermissionMode(),
       model: null,
       effort: null,
       createdAt: now,
@@ -735,12 +737,13 @@ export class SessionStore {
   // sessions. A session without a project has a folder of its own there, and so a directory of its own here.
   private rootFor(device: Device, path: string) {
     const key = pathKey(path);
-    this.database
+    const inserted = this.database
       .prepare('INSERT OR IGNORE INTO native_roots VALUES (?, ?, ?)')
       .run(device.id, key, randomUUID());
     const row = this.database
       .prepare('SELECT root FROM native_roots WHERE device_id = ? AND path_key = ?')
       .get(device.id, key)!;
+    if (Number(inserted.changes) > 0) linkProjectRoot(this.directory, String(row.root), path);
     return String(row.root);
   }
   // A session from before computers were told apart becomes that of the first one to use it, where it is.

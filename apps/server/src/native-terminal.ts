@@ -8,6 +8,7 @@ import type { SshConnection } from './tunnel.ts';
 import { readFileSync } from 'node:fs';
 import headless from '@xterm/headless';
 import serialize from '@xterm/addon-serialize';
+import { effectivePermissionMode } from './permission-default.ts';
 
 // node-pty takes a plain string map, while a process environment may hold undefined entries.
 export function definedEnvironment(env: NodeJS.ProcessEnv): Record<string, string> {
@@ -70,7 +71,9 @@ export function terminalArguments(
     resume ? '--resume' : '--session-id',
     session.id,
     '--permission-mode',
-    session.permissionMode === 'default' ? 'manual' : session.permissionMode,
+    session.permissionMode === 'default'
+      ? 'manual'
+      : effectivePermissionMode(session.permissionMode),
     ...(ssh
       ? ['--append-system-prompt', remotePrompt(session.projectPath, session.id, execution)]
       : []),
