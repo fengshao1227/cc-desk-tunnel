@@ -152,9 +152,9 @@ smoke_test() {  # <dir>
   as_user node --env-file="$tmp/service.env" "$dir/apps/server/src/main.ts" >"$tmp/log" 2>&1 & pid=$!
   for _ in $(seq 1 30); do grep -q 'Proxy native service' "$tmp/log" && { ok=1; break; }; sleep 1; done
   # $pid is runuser, which does not pass the signal on: stop the node it started by its unique --env-file.
-  pkill -TERM -f -- "--env-file=$tmp/service.env" 2>/dev/null
+  pkill -TERM -f -- "--env-file=$tmp/service.env" 2>/dev/null || true   # set -e: no match / killed child are not errors
   for _ in $(seq 1 10); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
-  pkill -KILL -f -- "--env-file=$tmp/service.env" 2>/dev/null; kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  pkill -KILL -f -- "--env-file=$tmp/service.env" 2>/dev/null || true; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
   [ -n "$ok" ] || { tail -20 "$tmp/log" >&2; rm -rf "$tmp"; die "smoke test failed: $(basename "$dir") did not start"; }
   rm -rf "$tmp"; log "smoke test passed"
 }
