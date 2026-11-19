@@ -19,6 +19,10 @@ APP=$CCDT_HOME/apps/cc-desk-tunnel
 CONF=$CCDT_HOME/.config/cc-desk-tunnel
 DATA=$CCDT_HOME/.local/share/cc-desk-tunnel
 
+# Run from a directory every user can read: as_user keeps the caller's cwd, and node walks up from it looking for
+# package.json, so a root shell left in /root makes `node -p` fail for the service user with EACCES.
+cd /
+
 log() { printf '\033[1m==> %s\033[0m\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 as_user() { runuser -u "$CCDT_USER" -- env HOME="$CCDT_HOME" PATH="$OPT/node24/bin:/usr/local/bin:/usr/bin:/bin" "$@"; }
