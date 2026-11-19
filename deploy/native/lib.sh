@@ -1,4 +1,5 @@
 # Shared steps of install.sh and upgrade.sh: a native (no Docker at run time) server on Linux,
+# portable to git 1.8 (no -C) and OpenSSL 1.0.2,
 # including hosts as old as CentOS 7 (glibc 2.17, gcc 4.8, OpenSSH 7.4, OpenSSL 1.0.2).
 # Sourced, not run. Every step is idempotent and fails loudly.
 
@@ -83,8 +84,7 @@ ensure_openssh() {
 # Source of one release directory: the fork at a ref (branch, tag or commit).
 fetch_source() {  # <ref> <dir>
   as_user git init -q "$2"
-  as_user git -C "$2" fetch -q --depth 1 "$CCDT_REPO" "$1"
-  as_user git -C "$2" checkout -q FETCH_HEAD
+  (cd "$2" && as_user git fetch -q --depth 1 "$CCDT_REPO" "$1" && as_user git checkout -q FETCH_HEAD)
 }
 
 # Production dependencies of the server; node-pty is built for this host's glibc.
