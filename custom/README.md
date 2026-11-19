@@ -16,6 +16,8 @@ Mac ── launchd: devlink-tunnel ── ssh -R 127.0.0.1:22022:127.0.0.1:22 �
 | `server/mcp-resilient` | 服务器 `~/.local/bin` | 隧道断了自动重连 MCP 后端，并重放 `initialize`。交互式 Claude Code 自己不会重启已退出的 stdio MCP |
 | `server/notify-device` | 服务器 `~/.local/bin` | Notification 钩子：Claude 等你时，在 Mac 上弹系统通知 |
 | `server/sync-project-map` | 服务器 `~/.local/bin` | 定时汇总各台 Mac 的 `projects.conf`，生成 `CCDT_PROJECT_MAP` 用的映射表 |
+| `mac/gui-helper.plist.in` + `mac/gui-helper-relay` | Mac | 让 launchd 在图形会话里拉起需要录屏或辅助功能权限的辅助程序，ssh 这边只做转发（见第 6 节） |
+| `server/computer-use-mac` | 服务器 `~/.local/bin` | 桌面控制 MCP（blade-computer-use）的包装脚本，可设置应用白名单 |
 
 ## 1. 服务器：隧道专用账号
 
@@ -114,7 +116,39 @@ claude mcp add -s user mac-browser -- ~/.local/bin/mcp-over-ssh mac-home \
 
 本仓库不包含任何修改 Claude Code 或官方扩展、绕过其登录要求的东西。
 
-## 6. 其他
+## 6. 桌面控制（computer use）
+
+浏览器之外，还可以让服务器上的 Claude 操作 Mac 上的应用：截图、读界面元素（AX 树）、点击、输入、按键、滚动。这里用的是开源的 [blade-computer-use](https://github.com/echoVic/blade-computer-use)（MIT）。它由一个 Node MCP 服务和一个常驻的 Swift 辅助程序组成，截图、读界面元素、发送键鼠事件都由辅助程序来做。
+
+**坑：ssh 拉起的辅助程序截不了屏。** macOS 的隐私权限（TCC）判断的是"负责进程"。经 ssh 启动的进程，负责进程是 `sshd-keygen-wrapper`，所以"录屏"会被拒绝。这时候 MCP 照样显示 Connected，但截图一定失败。
+
+**办法：让 launchd 在图形会话里拉起辅助程序，ssh 这边只做转发。**
+
+```bash
+# Mac：辅助程序改由 launchd 按连接拉起（inetd 模式，一个连接一个进程），权限就算在辅助程序自己头上
+cp custom/mac/gui-helper-relay ~/.local/bin/
+mkdir -p -m 700 ~/.local/state/blade-computer-use
+B=~/src/blade-computer-use   # blade 的源码目录，先按它的 README 编译好 native helper
+sed -e "s|@NAME@|blade|g" -e "s|@HOME@|$HOME|g" \
+    -e "s|@PROGRAM@|$B/native/BladeComputerUseHelper/.build/release/BladeComputerUseHelper|" \
+    -e "s|@SOCKET@|$HOME/.local/state/blade-computer-use/helper.sock|" \
+    custom/mac/gui-helper.plist.in > ~/Library/LaunchAgents/local.gui-helper.blade.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.gui-helper.blade.plist
+```
+
+然后在"系统设置 → 隐私与安全性"里，给 `BladeComputerUseHelper` 打开"录屏与系统录音"和"辅助功能"。如果没有提示，就手动添加上面那个路径。辅助程序是 ad-hoc 签名的，每次重新编译后都要重新授权。
+
+```bash
+# 服务器：blade 的 Node 服务经 ssh 启动，通过 gui-helper-relay 连到 launchd 拉起的那个辅助程序
+cp custom/server/{computer-use-mac,mcp-resilient} ~/.local/bin/
+CUA_HOST=mac-home CUA_APPS=com.apple.TextEdit claude mcp add -s user computer-use-mac -- ~/.local/bin/computer-use-mac
+```
+
+更稳妥的做法是把 `CUA_HOST`、`CUA_BLADE_DIR`、`CUA_APPS` 这几个变量直接写进脚本开头。`CUA_APPS` 填应用的 bundle id，多个用逗号隔开；填 `all` 表示所有应用（blade 仍然会禁止操作锁屏界面和系统授权弹窗）。在 bypass 模式下放开所有应用，就等于让 Claude 能以你的身份操作这台 Mac 上的任何应用，请自己想清楚再开。
+
+**验证：不要把 Connected 当作成功。** 新建一个测试文档，用 TextEdit 打开，依次 observe（确认返回的 PNG 确实是这个窗口）→ click 文本区 → observe → type_text → observe，最后确认输入的文字出现在 AX 树里。`ax_tree` 返回的是缩进文本，比如 `[2] AXTextArea value=...`，传给 `element_index` 的就是方括号里的数字。每次 observe 拿到的 revision 只能用于一次动作。
+
+## 7. 其他
 
 - **通知**：先把 `custom/server/notify-device` 放到 `~/.local/bin/`，再在服务器的 `~/.claude/settings.json` 里加上下面这段。`NOTIFY_HOST` 写在 `~/.claude/settings.json` 的 `env` 里，或者写进服务的环境：
 

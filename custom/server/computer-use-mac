@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Desktop control of a Mac for Claude Code on this server: blade-computer-use (github.com/echoVic/blade-computer-use)
+# running on the Mac, its native helper started by launchd in the Mac's GUI session (custom/mac/gui-helper.plist.in)
+# so screen capture is permitted. Register with:  claude mcp add -s user computer-use-mac -- ~/.local/bin/computer-use-mac
+set -euo pipefail
+HOST=${CUA_HOST:-mac-home}                                   # ssh alias of the Mac (through the reverse tunnel)
+BLADE=${CUA_BLADE_DIR:-'$HOME/src/blade-computer-use'}           # blade checkout on the Mac
+NODE=${CUA_NODE:-/opt/homebrew/opt/node@24/bin/node}         # Node 20+ on the Mac
+SOCKET=${CUA_SOCKET:-'$HOME/.local/state/blade-computer-use/helper.sock'}
+APPS=${CUA_APPS:-com.apple.TextEdit}                         # bundle ids, comma separated; "all" for every app
+if [ "$APPS" = all ]; then allow=CUA_ALLOW_ALL_APPS=1; else allow=CUA_ALLOWED_APPS=$APPS; fi
+exec "$(dirname "$0")/mcp-resilient" ssh -T -F "$HOME/.ssh/config" -o BatchMode=yes -o ConnectTimeout=10 "$HOST" \
+  "env $allow BLADE_NODE_PATH=$NODE GUI_HELPER_SOCKET=$SOCKET BLADE_COMPUTER_USE_HELPER=\$HOME/.local/bin/gui-helper-relay $BLADE/bin/blade-computer-use"

@@ -17,7 +17,7 @@
 ## 部署与周边
 
 - [deploy/native/](deploy/native/README.md)：不用 Docker 的原生部署（systemd），包括 CentOS 7 这类老系统；`install.sh` 用于首次安装，`upgrade.sh` 用于升级和回滚。
-- [custom/](custom/README.md)：Mac 端的部分，包括反向隧道、通过 SSH 把 Mac 上的 MCP 服务器（代码、检索、浏览器）接到服务器上、断线自动重连、`safe-edit`、通知钩子。
+- [custom/](custom/README.md)：Mac 端的部分，包括反向隧道、通过 SSH 把 Mac 上的 MCP 服务器（代码、检索、浏览器）接到服务器上、断线自动重连、`safe-edit`、通知钩子，以及桌面控制（computer use），包括 ssh 拉起的辅助程序截不了屏的解决办法。
 
 ## 和上游保持同步
 

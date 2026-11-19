@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stdio relay to a helper that launchd starts in the GUI session (see gui-helper.plist.in).
+# Point a tool's "helper command" at this script, with GUI_HELPER_SOCKET set to the LaunchAgent's socket.
+exec /usr/bin/nc -U "${GUI_HELPER_SOCKET:?set GUI_HELPER_SOCKET to the helper socket}"

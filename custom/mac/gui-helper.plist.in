@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- A helper that needs Screen Recording / Accessibility, started by launchd in the GUI (Aqua) session, one process
+     per connection to @SOCKET@ (inetd mode: stdin/stdout = the connection). Started this way, TCC attributes the
+     helper to itself; started over ssh it would be attributed to sshd-keygen-wrapper and screen capture is refused.
+     Replace @NAME@ @PROGRAM@ @SOCKET@ @HOME@, install as ~/Library/LaunchAgents/local.gui-helper.@NAME@.plist, then
+     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.gui-helper.@NAME@.plist -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.gui-helper.@NAME@</string>
+  <key>ProgramArguments</key><array><string>@PROGRAM@</string></array>
+  <key>inetdCompatibility</key><dict><key>Wait</key><false/></dict>
+  <key>Sockets</key><dict><key>Listener</key><dict>
+    <key>SockPathName</key><string>@SOCKET@</string>
+    <key>SockPathMode</key><integer>384</integer>
+  </dict></dict>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+  <key>StandardErrorPath</key><string>@HOME@/Library/Logs/gui-helper-@NAME@.err</string>
+</dict>
+</plist>
