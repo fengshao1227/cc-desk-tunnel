@@ -1,0 +1,61 @@
+#!/bin/bash
+# Reverse SSH tunnel from this Mac to a server, kept up by a LaunchAgent (KeepAlive). One per server:
+#   devlink-tunnel <name>      reads ~/.config/devlink/<name>.env:
+#     RELAY=devlink@203.0.113.10   # tunnel-only account on the server (see custom/README.md)
+#     RELAY_SSH_PORT=22
+#     REMOTE_PORT=22022            # the server reaches this Mac's sshd at 127.0.0.1:REMOTE_PORT
+#     KEY=$HOME/.ssh/devlink       # key authorized for RELAY
+#     PROXY_COMMAND=               # optional, e.g. "/usr/bin/nc -X 5 -x 127.0.0.1:7890 %h %p"
+#
+# Each run either confirms its tunnel is alive (sleep 30, exit) or starts it. A tunnel is recognised by port AND
+# relay, so tunnels to several servers on the same port number do not mistake each other for their own.
+# A server that keeps a dead session holding the port ("remote port forwarding failed") gets exactly that session
+# killed: its sshd pid is recorded on the server when the tunnel starts.
+set -u
+name=${1:?usage: devlink-tunnel <name>}
+conf=$HOME/.config/devlink/$name.env
+[ -r "$conf" ] || { echo "missing $conf" >&2; exit 2; }
+. "$conf"
+: "${RELAY:?} ${RELAY_SSH_PORT:=22} ${REMOTE_PORT:?} ${KEY:?}"
+PIDFILE=".devlink-tunnel-${REMOTE_PORT}.pid"
+LOG="$HOME/Library/Logs/devlink/tunnel-$name.log"
+mkdir -p "$(dirname "$LOG")"
+OPTS=(-i "$KEY" -p "$RELAY_SSH_PORT" -o BatchMode=yes)
+[ -z "${PROXY_COMMAND:-}" ] || OPTS+=(-o "ProxyCommand=$PROXY_COMMAND")
+
+log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
+
+tunnel_alive() {
+  local pid
+  for pid in $(/usr/bin/pgrep -x ssh 2>/dev/null); do
+    /bin/ps -o command= -p "$pid" 2>/dev/null | /usr/bin/grep -- "-R 127.0.0.1:${REMOTE_PORT}:" \
+      | /usr/bin/grep -q -- "$RELAY" && return 0
+  done
+  return 1
+}
+
+if tunnel_alive; then sleep 30; exit 0; fi
+
+err=$(/usr/bin/mktemp -t devlink-tunnel)
+log "starting tunnel 127.0.0.1:${REMOTE_PORT} -> $RELAY"
+# The remote command records its parent (this session's sshd), then waits without output, like -N.
+/usr/bin/ssh -R "127.0.0.1:${REMOTE_PORT}:127.0.0.1:22" "${OPTS[@]}" \
+  -o ExitOnForwardFailure=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+  "$RELAY" "echo \$PPID > $PIDFILE; exec sleep 2147483647" 2> "$err"
+rc=$?
+while IFS= read -r line; do log "ssh: $line"; done < "$err"
+log "tunnel exited rc=$rc"
+
+if /usr/bin/grep -q "remote port forwarding failed" "$err"; then
+  # Kill only the recorded session, only if it is a devlink sshd started when the pid file was written.
+  out=$(/usr/bin/ssh "${OPTS[@]}" -o ConnectTimeout=15 "$RELAY" "p=\$(cat $PIDFILE 2>/dev/null); \
+    if [ -n \"\$p\" ] && ps -o args= -p \"\$p\" 2>/dev/null | grep -q '^sshd: '; then \
+      d=\$(( \$(stat -c %Y /proc/\$p) - \$(stat -c %Y $PIDFILE) )); d=\${d#-}; \
+      if [ \"\$d\" -le 30 ]; then kill \"\$p\" && echo \"killed stale session pid \$p\"; \
+      else echo \"pid \$p started \${d}s away from the pid file, left alone\"; fi; \
+    else echo \"no recorded live session (pid=\$p)\"; fi" 2>&1)
+  log "port ${REMOTE_PORT} taken: $out"
+fi
+rm -f "$err"
+sleep 5
+exit "$rc"

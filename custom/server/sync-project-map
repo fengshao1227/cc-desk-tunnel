@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Union of the projects.conf of every Mac in SYNC_HOSTS -> ~/.config/cc-desk-tunnel/projects.conf (CCDT_PROJECT_MAP).
+# read by the local native-links patch of CC Desk Tunnel. The two Macs' files are not
+# synced with each other, so both are read. An unreachable Mac is skipped; if neither
+# answers the existing file is kept.
+set -uo pipefail
+out=$HOME/.config/cc-desk-tunnel/projects.conf
+tmp=$(mktemp "$out.XXXXXX") || exit 1
+trap 'rm -f "$tmp"' EXIT
+got=0
+for mac in ${SYNC_HOSTS:?set SYNC_HOSTS to the ssh aliases of the Macs, e.g. "mac-air mac-home"}; do
+  if timeout 15 ssh -F "$HOME/.ssh/config" -o BatchMode=yes -o ConnectTimeout=6 "$mac" \
+      'cat ~/.config/claudemax/projects.conf' >> "$tmp" 2>/dev/null; then
+    got=1
+  fi
+done
+[[ $got = 1 ]] || exit 0
+grep -v '^#' "$tmp" | tr -d '\r' | awk -F'|' 'NF>=2 && $1!="" && !seen[$1]++' > "$tmp.u" && mv -f "$tmp.u" "$tmp"
+chmod 600 "$tmp"; mv -f "$tmp" "$out"; trap - EXIT

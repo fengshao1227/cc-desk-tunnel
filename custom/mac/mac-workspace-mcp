@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""Small stdio MCP workspace gateway for a single Mac project root.
+
+Every byte a tool returns lands in the calling model's context, so results are
+plain text, paths are relative to the root, and each output has a budget that
+says so when it is hit. Edits are applied to a file's current bytes, keep its
+mode and line endings, and never need the caller to have read the whole file.
+"""
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from typing import Any, Dict
+
+READ_DEFAULT_LINES = 600
+READ_MAX_LINE_CHARS = 1000
+FIND_DEFAULT_RESULTS = 100
+FIND_MAX_RESULTS = 500
+FIND_MAX_COLUMNS = 300
+EXEC_DEFAULT_OUTPUT = 12000
+EXEC_MAX_OUTPUT = 60000
+JOB_DEFAULT_OUTPUT = 4000
+SHA_PREFIX = 16
+JOB_DIR = pathlib.Path(tempfile.gettempdir()) / "mac-workspace-jobs"
+
+
+def clip_output(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    head = limit // 4
+    tail = limit - head
+    omitted = len(text) - head - tail
+    return (text[:head] + f"\n[... {omitted} chars omitted; filter the command (grep/head/cut) "
+            f"or pass max_output_chars (max {EXEC_MAX_OUTPUT}) ...]\n" + text[-tail:])
+
+
+def clip_line(line: str) -> str:
+    if len(line) <= READ_MAX_LINE_CHARS:
+        return line
+    return line[:READ_MAX_LINE_CHARS] + f" ...[+{len(line) - READ_MAX_LINE_CHARS} chars]"
+
+
+def bounded(args: Dict[str, Any], key: str, default: int, low: int, high: int) -> int:
+    return min(high, max(low, int(args.get(key, default))))
+
+
+def decode_output(value: Any) -> str:
+    if value is None:
+        return ""
+    return value.decode("utf-8", "replace") if isinstance(value, bytes) else value
+
+
+class Workspace:
+    def __init__(self, root: str):
+        self.root = pathlib.Path(root).expanduser().resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.lock_handle = None
+        self.jobs: Dict[str, Dict[str, Any]] = {}
+
+    def path(self, value: str) -> pathlib.Path:
+        candidate = (self.root / value).resolve() if not os.path.isabs(value) else pathlib.Path(value).resolve()
+        try:
+            candidate.relative_to(self.root)
+        except ValueError:
+            raise ValueError("path is outside the workspace root")
+        if any(part in {".env", ".gitlab-token", ".deploy-keys"} or part.startswith(".env.") for part in candidate.parts):
+            raise ValueError("sensitive paths are not exposed through the workspace gateway")
+        return candidate
+
+    def rel(self, path: pathlib.Path) -> str:
+        try:
+            return str(path.relative_to(self.root)) or "."
+        except ValueError:
+            return str(path)
+
+    def digest(self, path: pathlib.Path) -> str:
+        h = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def check_expected(self, path: pathlib.Path, expected: Any, action: str) -> None:
+        # The full hash or the prefix workspace_read prints both count.
+        if not expected or not path.exists():
+            return
+        actual = self.digest(path)
+        if len(str(expected)) < 8 or not actual.startswith(str(expected)):
+            raise ValueError(f"{action} refused: {self.rel(path)} changed since it was read "
+                             f"(sha256 now {actual[:SHA_PREFIX]})")
+
+    def text_of(self, path: pathlib.Path) -> str:
+        if not path.is_file():
+            raise ValueError(f"file does not exist: {self.rel(path)}")
+        try:
+            return path.read_bytes().decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError(f"{self.rel(path)} is not UTF-8 text")
+
+    def atomic_write(self, path: pathlib.Path, content: str) -> None:
+        # Keep the mode of the file being replaced: a temp file is born 0600,
+        # and replacing a script with it used to drop its executable bit.
+        mode = path.stat().st_mode & 0o7777 if path.exists() else 0o644
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".workspace-", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(content.encode("utf-8"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, mode)
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def read(self, args: Dict[str, Any]) -> str:
+        path = self.path(args["path"])
+        if not path.is_file():
+            raise ValueError(f"file does not exist: {self.rel(path)}")
+        lines = path.read_bytes().decode("utf-8", "replace").splitlines()
+        total = len(lines)
+        # offset/limit are the names agents know from their own Read tool.
+        ranged = any(key in args for key in ("start_line", "end_line", "offset", "limit"))
+        start = max(1, int(args.get("start_line", args.get("offset", 1)) or 1))
+        if "end_line" in args:
+            end = int(args["end_line"])
+        elif "limit" in args:
+            end = start + int(args["limit"]) - 1
+        else:
+            end = start + READ_DEFAULT_LINES - 1
+        end = min(total, end)
+        body = "\n".join(f"{i}: {clip_line(lines[i - 1])}" for i in range(start, end + 1))
+        header = f"{self.rel(path)} sha256:{self.digest(path)[:SHA_PREFIX]} lines {start}-{end} of {total}"
+        if end < total and not ranged:
+            header += f" (first {READ_DEFAULT_LINES} only; pass start_line/end_line for the rest)"
+        return header + "\n" + body
+
+    def find(self, args: Dict[str, Any]) -> str:
+        pattern = args.get("pattern", "")
+        scope = self.rel(self.path(args.get("path", ".")))
+        limit = bounded(args, "max_results", FIND_DEFAULT_RESULTS, 1, FIND_MAX_RESULTS)
+        rg = "/opt/homebrew/bin/rg" if pathlib.Path("/opt/homebrew/bin/rg").exists() else "rg"
+        command = [rg, "--hidden", "--glob", "!.git/**", "--glob", "!.env*"]
+        if args.get("files_only"):
+            # Name/path matching by glob, which searching contents cannot do.
+            command += ["--files", "--glob", pattern, scope]
+        else:
+            mode = args.get("output_mode", "content")
+            if args.get("ignore_case"):
+                command.append("--ignore-case")
+            if args.get("glob"):
+                command += ["--glob", str(args["glob"])]
+            if args.get("type"):
+                command += ["--type", str(args["type"])]
+            if mode == "files":
+                command.append("--files-with-matches")
+            elif mode == "count":
+                command.append("--count")
+            else:
+                command += ["--with-filename", "--line-number", "--max-columns", str(FIND_MAX_COLUMNS), "--max-columns-preview"]
+                context = bounded(args, "context", 0, 0, 20)
+                if context:
+                    command += ["--context", str(context)]
+            command += ["--regexp", pattern, scope]
+        # Run from the root with a relative scope, so every path comes back
+        # relative: an absolute prefix repeated on each line is pure cost.
+        result = subprocess.run(command, cwd=self.root, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        if result.returncode not in (0, 1):
+            raise RuntimeError(result.stderr.strip() or "rg failed")
+        matches = [line[2:] if line.startswith("./") else line for line in result.stdout.splitlines()]
+        if not matches:
+            return "(no matches)"
+        more = f"\n[... {len(matches) - limit} more lines; narrow pattern/path/glob ...]" if len(matches) > limit else ""
+        return "\n".join(matches[:limit]) + more
+
+    def write(self, args: Dict[str, Any]) -> str:
+        path = self.path(args["path"])
+        self.check_expected(path, args.get("expected_sha256"), "write")
+        self.atomic_write(path, args.get("content", ""))
+        return f"wrote {self.rel(path)} sha256:{self.digest(path)[:SHA_PREFIX]}"
+
+    def patch(self, args: Dict[str, Any]) -> str:
+        path = self.path(args["path"])
+        self.check_expected(path, args.get("expected_sha256"), "patch")
+        content = self.text_of(path)
+        old, new = args["old_text"], args["new_text"]
+        if old == new:
+            raise ValueError("old_text and new_text are identical")
+        count = content.count(old)
+        if count == 0:
+            raise ValueError(f"old_text not found in {self.rel(path)}; re-read the lines you are replacing")
+        replace_all = bool(args.get("replace_all"))
+        if count > 1 and not replace_all:
+            raise ValueError(f"old_text matches {count} places in {self.rel(path)}; "
+                             "include surrounding lines to make it unique, or pass replace_all")
+        line = content[:content.index(old)].count("\n") + 1
+        # Applied to the file's current bytes, so changes others made elsewhere
+        # in it survive; expected_sha256 is only needed to refuse those too.
+        self.atomic_write(path, content.replace(old, new) if replace_all else content.replace(old, new, 1))
+        done = count if replace_all else 1
+        return f"patched {self.rel(path)}: {done} replacement(s), first at line {line}; sha256:{self.digest(path)[:SHA_PREFIX]}"
+
+    def execute(self, args: Dict[str, Any]) -> str:
+        cwd = self.path(args.get("cwd", "."))
+        env = os.environ.copy()
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + env.get("PATH", "")
+        if args.get("background"):
+            return self.start_job(args["command"], cwd, env)
+        timeout = bounded(args, "timeout_seconds", 120, 1, 600)
+        limit = bounded(args, "max_output_chars", EXEC_DEFAULT_OUTPUT, 1000, EXEC_MAX_OUTPUT)
+        try:
+            result = subprocess.run(["/bin/bash", "-lc", args["command"]], cwd=cwd, env=env, text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            # What it printed before the deadline is still worth having.
+            return (f"timed out after {timeout}s (raise timeout_seconds up to 600, or pass background=true)\n"
+                    + clip_output(decode_output(exc.stdout), limit))
+        return f"exit: {result.returncode}\n" + clip_output(result.stdout, limit)
+
+    def start_job(self, command: str, cwd: pathlib.Path, env: Dict[str, str]) -> str:
+        JOB_DIR.mkdir(parents=True, exist_ok=True)
+        job_id = uuid.uuid4().hex[:8]
+        log = JOB_DIR / f"{job_id}.log"
+        with log.open("wb") as handle:
+            process = subprocess.Popen(["/bin/bash", "-lc", command], cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                       stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
+        self.jobs[job_id] = {"process": process, "log": log, "command": command, "started": time.time()}
+        return f"job {job_id} started (pid {process.pid}); check it with workspace_job id={job_id}"
+
+    def job(self, args: Dict[str, Any]) -> str:
+        job_id = args.get("id")
+        if not job_id:
+            if not self.jobs:
+                return "(no jobs in this session)"
+            rows = []
+            for key, job in self.jobs.items():
+                code = job["process"].poll()
+                state = "running" if code is None else f"exit {code}"
+                rows.append(f"{key} {state} {int(time.time() - job['started'])}s {job['command'][:80]}")
+            return "\n".join(rows)
+        job = self.jobs.get(job_id)
+        if not job:
+            raise ValueError(f"no job {job_id} in this session")
+        process = job["process"]
+        wait = bounded(args, "wait_seconds", 0, 0, 600)
+        if wait:
+            try:
+                process.wait(timeout=wait)
+            except subprocess.TimeoutExpired:
+                pass
+        if args.get("kill") and process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+        code = process.poll()
+        state = "running" if code is None else f"exit {code}"
+        output = job["log"].read_bytes().decode("utf-8", "replace")
+        limit = bounded(args, "max_output_chars", JOB_DEFAULT_OUTPUT, 500, EXEC_MAX_OUTPUT)
+        head = f"job {job_id}: {state}, {int(time.time() - job['started'])}s, {len(output)} chars of output"
+        if len(output) > limit:
+            return head + f" (last {limit} shown)\n" + output[-limit:]
+        return head + "\n" + output
+
+    def lock(self, args: Dict[str, Any]) -> str:
+        import fcntl
+        if self.lock_handle:
+            return "workspace lock already held by this MCP session"
+        lock_path = self.root / ".ai" / "workspace.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            raise ValueError("workspace is locked by another agent")
+        handle.write(json.dumps({"pid": os.getpid(), "reason": args.get("reason", "")}) + "\n")
+        handle.flush()
+        self.lock_handle = handle
+        return "workspace lock acquired"
+
+    def unlock(self) -> str:
+        import fcntl
+        if not self.lock_handle:
+            return "workspace lock was not held by this MCP session"
+        fcntl.flock(self.lock_handle.fileno(), fcntl.LOCK_UN)
+        self.lock_handle.close()
+        self.lock_handle = None
+        return "workspace lock released"
+
+    def projects(self) -> str:
+        rows = [f"root: {self.root}"]
+        for child in sorted(self.root.iterdir()):
+            if not child.is_dir() or child.name.startswith(".") or not (child / ".git").exists():
+                continue
+            result = subprocess.run(["git", "status", "--short", "--branch"], cwd=child, text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            status = result.stdout.splitlines()
+            rows.append(f"{child.name}: " + (status[0] if status else ""))
+            rows += ["  " + line for line in status[1:8]]
+            if len(status) > 8:
+                rows.append(f"  ... {len(status) - 8} more changed paths")
+        return "\n".join(rows)
+
+
+def reply(request_id: Any, result: Any = None, error: str = None):
+    message = {"jsonrpc": "2.0", "id": request_id}
+    if error is None:
+        message["result"] = result
+    else:
+        message["error"] = {"code": -32000, "message": error}
+    sys.stdout.write(json.dumps(message, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def schema(properties: Dict[str, Any], required=()) -> Dict[str, Any]:
+    return {"type": "object", "properties": properties, "required": list(required)}
+
+
+INT = {"type": "integer"}
+STR = {"type": "string"}
+BOOL = {"type": "boolean"}
+
+TOOLS = {
+    "workspace_status": {"description": "Workspace root and the git branch/status of each project in it.", "inputSchema": schema({})},
+    "workspace_projects": {"description": "Same as workspace_status.", "inputSchema": schema({})},
+    "workspace_read": {"description": "Read a text file, like Read. Paths are relative to the workspace root (e.g. 'new-api/service/x.go'). Returns numbered lines and a 16-char sha256 prefix. Without a range: the first 600 lines. For bigger files find the spot with workspace_find, then read just that range with start_line/end_line (offset/limit also accepted). Lines over 1000 chars are cut.", "inputSchema": schema({"path": STR, "start_line": {"type": "integer", "description": "First line, 1-based."}, "end_line": {"type": "integer", "description": "Last line, inclusive."}, "offset": {"type": "integer", "description": "Alias of start_line."}, "limit": {"type": "integer", "description": "Number of lines."}}, ["path"])},
+    "workspace_find": {"description": "ripgrep over the workspace, like Grep. output_mode: content (path:line:text, default), files (matching paths only), count (matches per file). Scope with path (e.g. 'new-api/service'), glob ('*.go') or type ('go'); ignore_case; context = lines around each match (max 20); max_results (default 100, max 500). files_only=true matches file names by glob instead, like Glob. Paths come back relative to the root; long lines are cut.", "inputSchema": schema({"pattern": {"type": "string", "description": "Regex over contents, or a glob such as '**/topup*.go' when files_only is true."}, "path": STR, "output_mode": {"type": "string", "enum": ["content", "files", "count"]}, "glob": STR, "type": STR, "ignore_case": BOOL, "context": INT, "max_results": INT, "files_only": BOOL}, ["pattern"])},
+    "workspace_patch": {"description": "Edit a file, like Edit: replace old_text with new_text. old_text must match exactly once (include surrounding lines to make it unique) unless replace_all is true. No need to read the whole file first or pass expected_sha256: the edit is applied to the file's current content, so changes others made elsewhere in it are kept. Keeps file mode and line endings. Returns the line it changed.", "inputSchema": schema({"path": STR, "old_text": STR, "new_text": STR, "replace_all": BOOL, "expected_sha256": {"type": "string", "description": "Optional; full hash or the 16-char prefix. Refuses if the file changed since."}}, ["path", "old_text", "new_text"])},
+    "workspace_write": {"description": "Create or overwrite a whole file, like Write. For an existing file pass expected_sha256 (full or the 16-char prefix from workspace_read) so a concurrent change is not overwritten; for edits prefer workspace_patch. Keeps the mode of a file it replaces.", "inputSchema": schema({"path": STR, "content": STR, "expected_sha256": STR}, ["path", "content"])},
+    "workspace_exec": {"description": "Run a bash command in the workspace root (cwd to scope), like Bash. Calls run one at a time, so a slow command blocks every other call: pass background=true for anything over a minute (builds, full test runs, deploy watches) and follow it with workspace_job. timeout_seconds: default 120, max 600; on timeout the output so far is returned. Output over max_output_chars (default 12000, max 60000) keeps head and tail with a marker; filter with grep/head/tail rather than raising it.", "inputSchema": schema({"command": STR, "cwd": STR, "timeout_seconds": INT, "max_output_chars": INT, "background": BOOL}, ["command"])},
+    "workspace_job": {"description": "Check a background workspace_exec job: state, elapsed time and the tail of its output (max_output_chars, default 4000). wait_seconds (max 600) first waits for it to finish, so one call can replace a polling loop; kill=true stops it. Without id: list this session's jobs.", "inputSchema": schema({"id": STR, "wait_seconds": INT, "max_output_chars": INT, "kill": BOOL})},
+    "workspace_lock": {"description": "Acquire an exclusive project write lock for this MCP session.", "inputSchema": schema({"reason": STR})},
+    "workspace_unlock": {"description": "Release the project write lock.", "inputSchema": schema({})},
+}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", required=True)
+    workspace = Workspace(parser.parse_args().root)
+    handlers = {
+        "workspace_status": lambda args: workspace.projects(),
+        "workspace_projects": lambda args: workspace.projects(),
+        "workspace_read": workspace.read,
+        "workspace_find": workspace.find,
+        "workspace_patch": workspace.patch,
+        "workspace_write": workspace.write,
+        "workspace_exec": workspace.execute,
+        "workspace_job": workspace.job,
+        "workspace_lock": workspace.lock,
+        "workspace_unlock": lambda args: workspace.unlock(),
+    }
+    for line in sys.stdin:
+        request = {}
+        try:
+            request = json.loads(line)
+            method = request.get("method")
+            request_id = request.get("id")
+            if method == "initialize":
+                reply(request_id, {"protocolVersion": request.get("params", {}).get("protocolVersion", "2024-11-05"), "capabilities": {"tools": {}}, "serverInfo": {"name": "mac-workspace", "version": "0.3.0"}})
+            elif method == "tools/list":
+                reply(request_id, {"tools": [{"name": name, **spec} for name, spec in TOOLS.items()]})
+            elif method == "notifications/initialized":
+                continue
+            elif method == "tools/call":
+                params = request.get("params", {})
+                name, args = params.get("name"), params.get("arguments", {}) or {}
+                if name not in handlers:
+                    raise ValueError("unknown tool: " + str(name))
+                reply(request_id, {"content": [{"type": "text", "text": str(handlers[name](args))}]})
+            elif request_id is not None:
+                reply(request_id, error="unsupported method: " + str(method))
+        except Exception as exc:
+            if request.get("id") is not None:
+                reply(request.get("id"), error=str(exc))
+
+
+if __name__ == "__main__":
+    main()

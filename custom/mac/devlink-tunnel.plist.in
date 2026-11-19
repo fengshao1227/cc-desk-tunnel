@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Install as ~/Library/LaunchAgents/local.devlink-tunnel.@NAME@.plist with @NAME@ and @HOME@ replaced, then:
+     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.devlink-tunnel.@NAME@.plist -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.devlink-tunnel.@NAME@</string>
+  <key>ProgramArguments</key><array><string>@HOME@/.local/bin/devlink-tunnel</string><string>@NAME@</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>15</integer>
+  <key>StandardOutPath</key><string>@HOME@/Library/Logs/devlink/launchd-@NAME@.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/Library/Logs/devlink/launchd-@NAME@.err</string>
+</dict>
+</plist>

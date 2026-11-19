@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""Keep a stdio MCP server alive across a dropped Mac tunnel.
+
+Usage: mcp-resilient <command> [args...]
+
+Claude Code marks a stdio MCP server failed the moment its process exits and,
+in an interactive session, never restarts it: the user has to open /mcp and
+press Reconnect. The Mac-side servers here are an ssh command, so every tunnel
+blip (lid closed, Wi-Fi change, network hiccup) ended them for the session.
+
+This proxy sits between Claude Code and that command. It remembers the
+client's `initialize` request and `notifications/initialized`. When the
+backend exits it:
+  1. answers every request still waiting with a JSON-RPC error that says the
+     link dropped and the call should be retried (nothing hangs);
+  2. restarts the backend with backoff until it comes up again;
+  3. replays `initialize` (swallowing the reply) and `initialized`;
+  4. sends the requests that arrived meanwhile, or fails them after
+     QUEUE_LIMIT seconds so the model is never left waiting indefinitely.
+To Claude Code the server never went away.
+
+Stdlib only; runs on the CentOS 7 python 3.6.
+"""
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+
+QUEUE_LIMIT = float(os.environ.get("MCP_RESILIENT_QUEUE_LIMIT", "90"))
+REPLAY_TIMEOUT = float(os.environ.get("MCP_RESILIENT_REPLAY_TIMEOUT", "60"))
+LOG = os.environ.get("MCP_RESILIENT_LOG", os.path.expanduser("~/.cache/mcp-resilient.log"))
+REINIT_ID = "__mcp_resilient_reinit__"
+FIRST_START_ATTEMPTS = int(os.environ.get("MCP_RESILIENT_FIRST_START_ATTEMPTS", "3"))
+STDERR_KEEP = 20
+
+
+def log(msg):
+    try:
+        with open(LOG, "a") as f:
+            f.write("%s [%s] %s\n" % (time.strftime("%F %T"), NAME, msg))
+    except OSError:
+        pass
+
+
+NAME = os.path.basename(sys.argv[1]) if len(sys.argv) > 1 else "?"
+out_lock = threading.Lock()
+
+
+def to_client(obj_or_line):
+    line = obj_or_line if isinstance(obj_or_line, str) else json.dumps(obj_or_line)
+    with out_lock:
+        sys.stdout.write(line.rstrip("\n") + "\n")
+        sys.stdout.flush()
+
+
+class Proxy:
+    def __init__(self, argv):
+        self.argv = argv
+        self.cond = threading.Condition()
+        self.proc = None
+        self.ready = False          # backend initialized and accepting traffic
+        self.client_done = False
+        self.init_line = None       # client's initialize request
+        self.initialized_line = None
+        self.pending = {}           # request id (json) -> True, sent to backend
+        self.queue = []             # (deadline, line, id) waiting for reconnect
+        self.reinit_reply = None
+        self.init_id = None         # client's initialize id, until it is answered
+        self.init_answered = False
+        self.first_failures = 0
+        self.stderr_tail = []
+
+    # backend lifecycle -------------------------------------------------
+    def spawn(self):
+        self.proc = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, bufsize=0)
+        threading.Thread(target=self.pump_backend, args=(self.proc,), daemon=True).start()
+        threading.Thread(target=self.pump_stderr, args=(self.proc,), daemon=True).start()
+
+    def pump_stderr(self, proc):
+        """Pass backend stderr through and keep its tail for a first-start error."""
+        for raw in iter(proc.stderr.readline, b""):
+            line = raw.decode("utf-8", "replace")
+            try:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+            except (OSError, ValueError):
+                pass
+            with self.cond:
+                self.stderr_tail = (self.stderr_tail + [line.rstrip("\n")])[-STDERR_KEEP:]
+
+    def send_backend(self, line):
+        try:
+            self.proc.stdin.write((line.rstrip("\n") + "\n").encode())
+            self.proc.stdin.flush()
+            return True
+        except (OSError, ValueError, AttributeError):
+            return False
+
+    def pump_backend(self, proc):
+        for raw in iter(proc.stdout.readline, b""):
+            line = raw.decode("utf-8", "replace")
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(msg, dict) and msg.get("id") == REINIT_ID:
+                with self.cond:
+                    self.reinit_reply = msg
+                    self.cond.notify_all()
+                continue
+            if isinstance(msg, dict) and "id" in msg and ("result" in msg or "error" in msg):
+                with self.cond:
+                    self.pending.pop(json.dumps(msg["id"]), None)
+                    if not self.init_answered and msg["id"] == self.init_id:
+                        self.init_answered = True
+            to_client(line)
+        proc.wait()
+        with self.cond:
+            if proc is self.proc:
+                self.ready = False
+                self.cond.notify_all()
+
+    def fail(self, rid, why):
+        to_client({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": why}})
+
+    def supervise(self):
+        """Restart the backend whenever it dies after the session started."""
+        delay = 1.0
+        while True:
+            with self.cond:
+                while self.ready and not self.client_done:
+                    self.cond.wait()
+                if self.client_done:
+                    return
+                if self.init_line is None:      # not started by the client yet
+                    self.cond.wait(1)
+                    continue
+                for key in list(self.pending):
+                    self.fail(json.loads(key), "Mac link dropped while this call ran; "
+                              "it has been reconnected or is reconnecting - retry the call.")
+                self.pending.clear()
+            if not self.init_answered and self.first_start_exhausted():
+                return
+            log("backend down, restarting")
+            if self.reconnect():
+                delay = 1.0
+                log("backend back")
+                self.flush_queue()
+            else:
+                time.sleep(delay)
+                delay = min(delay * 2, 15)
+            self.expire_queue()
+
+    def first_start_exhausted(self):
+        """The backend died before ever answering the client's initialize.
+
+        Retry a few times (a tunnel blip), then answer initialize with the
+        backend's own error and exit, instead of retrying until the client's
+        connect timeout hides the real cause."""
+        self.first_failures += 1
+        if self.first_failures < FIRST_START_ATTEMPTS:
+            return False
+        with self.cond:
+            tail = "\n".join(self.stderr_tail[-5:]) or "(no stderr)"
+        why = "backend exited before initialize (%d attempts): %s" % (self.first_failures, tail)
+        log(why.replace("\n", " | "))
+        self.fail(self.init_id, why)
+        os._exit(1)
+
+    def reconnect(self):
+        try:
+            if self.proc and self.proc.poll() is None:
+                self.proc.kill()
+        except OSError:
+            pass
+        self.reinit_reply = None
+        try:
+            self.spawn()
+        except OSError as e:
+            log("spawn failed: %s" % e)
+            return False
+        init = json.loads(self.init_line)
+        init["id"] = REINIT_ID
+        if not self.send_backend(json.dumps(init)):
+            return False
+        deadline = time.time() + REPLAY_TIMEOUT
+        with self.cond:
+            while self.reinit_reply is None and self.proc.poll() is None and time.time() < deadline:
+                self.cond.wait(0.5)
+            ok = self.reinit_reply is not None and "result" in self.reinit_reply
+        if not ok:
+            return False
+        with self.cond:
+            if not self.init_answered:          # first start recovered on a retry
+                reply = dict(self.reinit_reply, id=self.init_id)
+                self.init_answered = True
+                to_client(reply)
+        if self.initialized_line:
+            self.send_backend(self.initialized_line)
+        with self.cond:
+            self.ready = True
+            self.cond.notify_all()
+        return True
+
+    def flush_queue(self):
+        with self.cond:
+            items, self.queue = self.queue, []
+        for _deadline, line, rid in items:
+            self.forward(line, rid)
+
+    def expire_queue(self):
+        now = time.time()
+        with self.cond:
+            keep = []
+            for item in self.queue:
+                if item[0] < now:
+                    if item[2] is not None:
+                        self.fail(item[2], "Mac link is down and did not come back within "
+                                  "%d s; check the devlink tunnel, then retry." % QUEUE_LIMIT)
+                else:
+                    keep.append(item)
+            self.queue = keep
+
+    # client side ---------------------------------------------------------
+    def forward(self, line, rid):
+        with self.cond:
+            if not self.ready and self.init_line is not None and rid != "init":
+                self.queue.append((time.time() + QUEUE_LIMIT, line, rid))
+                return
+            if rid not in (None, "init"):
+                self.pending[json.dumps(rid)] = True
+        if not self.send_backend(line) and rid not in (None, "init"):
+            with self.cond:
+                self.pending.pop(json.dumps(rid), None)
+                self.ready = False
+                self.queue.append((time.time() + QUEUE_LIMIT, line, rid))
+                self.cond.notify_all()
+
+    def run(self):
+        self.spawn()
+        threading.Thread(target=self.supervise, daemon=True).start()
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                self.send_backend(line)
+                continue
+            method = msg.get("method") if isinstance(msg, dict) else None
+            if method == "initialize":
+                self.init_line = line
+                self.init_id = msg.get("id")
+                self.send_backend(line)          # first start: reply goes to the client
+                with self.cond:
+                    self.ready = True
+                    self.cond.notify_all()
+                continue
+            if method == "notifications/initialized":
+                self.initialized_line = line
+            is_request = isinstance(msg, dict) and method is not None and "id" in msg
+            self.forward(line, msg["id"] if is_request else None)
+        with self.cond:
+            self.client_done = True
+            self.cond.notify_all()
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=5)
+        except Exception:
+            self.proc.kill()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        sys.stderr.write("usage: mcp-resilient <command> [args...]\n")
+        sys.exit(2)
+    Proxy(sys.argv[1:]).run()

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Run a stdio MCP server on a Mac and serve it to Claude Code on this host, surviving tunnel drops.
+#
+#   claude mcp add -s user mac-workspace -- ~/.local/bin/mcp-over-ssh mac-home \
+#       '~/.local/bin/mac-workspace-mcp-router --remote-root {cwd}'
+#
+# HOST is an ssh alias (usually through a reverse tunnel, see custom/README.md). COMMAND runs on the Mac; {cwd} is
+# replaced by this host's physical working directory. Use the physical one: Claude Code may hand MCP servers a PWD
+# that is a symlink (CC Desk Tunnel's project links), and a router keyed by path would not recognise it.
+set -euo pipefail
+[ $# -ge 2 ] || { echo "usage: mcp-over-ssh HOST COMMAND" >&2; exit 2; }
+host=$1; shift
+command=${*//\{cwd\}/$(printf '%q' "$(pwd -P)")}
+exec "$(dirname "$0")/mcp-resilient" ssh -F "$HOME/.ssh/config" "$host" "$command"

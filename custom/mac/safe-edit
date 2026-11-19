@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""safe-edit: exact, unique text replacement for use over SSH (what workspace_patch does).
+
+Usage:
+  safe-edit FILE [--all] [--expect-sha SHA256] <<'EOF'
+  <old text>
+  @@@@ SAFE-EDIT @@@@
+  <new text>
+  EOF
+  safe-edit FILE --sha        print the file's sha256 (to pass as --expect-sha later)
+
+The old text must occur exactly once (or at least once with --all), or nothing is
+written. With --expect-sha the file must still have that sha256, so an edit made
+in the meantime by someone else is not overwritten. The write is atomic and keeps
+the file mode. Prints the replacement count and the new sha256.
+"""
+import hashlib, os, sys, tempfile
+
+SEP = "@@@@ SAFE-EDIT @@@@"
+
+def die(msg, code=1):
+    sys.stderr.write("safe-edit: %s\n" % msg); sys.exit(code)
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip()); return 0
+    path, opts = argv[0], argv[1:]
+    try:
+        data = open(path, "rb").read()
+    except OSError as e:
+        die("cannot read %s: %s" % (path, e.strerror))
+    sha = hashlib.sha256(data).hexdigest()
+    if opts == ["--sha"]:
+        print(sha); return 0
+    replace_all = "--all" in opts
+    expect = None
+    if "--expect-sha" in opts:
+        i = opts.index("--expect-sha")
+        if i + 1 >= len(opts): die("--expect-sha needs a value", 2)
+        expect = opts[i + 1]
+    if expect and expect != sha:
+        die("sha256 mismatch: file is %s, expected %s; re-read it" % (sha, expect))
+    payload = sys.stdin.read()
+    if SEP not in payload:
+        die("stdin must hold old text, a line '%s', then new text" % SEP, 2)
+    old, new = payload.split("\n" + SEP + "\n", 1) if ("\n" + SEP + "\n") in payload else payload.split(SEP, 1)
+    if new.endswith("\n") and not old.endswith("\n"):
+        new = new[:-1]          # heredoc adds a final newline the old text did not have
+    if not old:
+        die("old text is empty", 2)
+    text = data.decode("utf-8")
+    n = text.count(old)
+    if n == 0: die("old text not found; nothing written")
+    if n > 1 and not replace_all: die("old text found %d times; make it unique or pass --all" % n)
+    out = (text.replace(old, new) if replace_all else text.replace(old, new, 1)).encode("utf-8")
+    mode = os.stat(path).st_mode & 0o7777
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), prefix=".safe-edit.")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(out)
+        os.chmod(tmp, mode); os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp); raise
+    print("replaced %d, sha256 %s" % (n if replace_all else 1, hashlib.sha256(out).hexdigest()))
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
