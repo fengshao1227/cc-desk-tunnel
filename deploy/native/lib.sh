@@ -41,7 +41,7 @@ install_node() {
   dir=$OPT/$name
   if [ ! -x "$dir/bin/node" ]; then
     log "Node $NODE_VERSION ($name)"
-    local tmp; tmp=$(mktemp -d)
+    local tmp; tmp=$(mktemp -d); chmod 755 "$tmp"   # the service user unpacks from it
     curl -fsSL --max-time 300 -o "$tmp/$name.tar.xz" "$base/$name.tar.xz"
     curl -fsSL --max-time 60 -o "$tmp/SHASUMS256.txt" "$base/SHASUMS256.txt"
     (cd "$tmp" && grep " $name.tar.xz\$" SHASUMS256.txt | sha256sum -c -) || die "Node checksum mismatch"
@@ -151,7 +151,10 @@ smoke_test() {  # <dir>
   chown "$CCDT_UID:$CCDT_GID" "$tmp/service.env"; chmod 600 "$tmp/service.env"
   as_user node --env-file="$tmp/service.env" "$dir/apps/server/src/main.ts" >"$tmp/log" 2>&1 & pid=$!
   for _ in $(seq 1 30); do grep -q 'Proxy native service' "$tmp/log" && { ok=1; break; }; sleep 1; done
-  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  # $pid is runuser, which does not pass the signal on: stop the node it started by its unique --env-file.
+  pkill -TERM -f -- "--env-file=$tmp/service.env" 2>/dev/null
+  for _ in $(seq 1 10); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+  pkill -KILL -f -- "--env-file=$tmp/service.env" 2>/dev/null; kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
   [ -n "$ok" ] || { tail -20 "$tmp/log" >&2; rm -rf "$tmp"; die "smoke test failed: $(basename "$dir") did not start"; }
   rm -rf "$tmp"; log "smoke test passed"
 }
