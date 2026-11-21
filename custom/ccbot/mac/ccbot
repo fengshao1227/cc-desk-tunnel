@@ -1,0 +1,15 @@
+#!/bin/sh
+# ccbot on the Mac: the same commands, run on the server over the bot's own SSH key, which can run nothing
+# but ccbot there. Free text (tasks, messages, answers) goes on stdin. Settings in ~/.config/ccbot/env:
+#   CCBOT_HOST=claude@<server>  CCBOT_PORT=<ssh port>  CCBOT_KEY=~/.ssh/ccbot_grok
+set -eu
+[ -f "$HOME/.config/ccbot/env" ] && . "$HOME/.config/ccbot/env"
+: "${CCBOT_HOST:?set CCBOT_HOST in ~/.config/ccbot/env}"
+for arg in "$@"; do
+  case $arg in *[[:space:]]*) echo "ccbot: 参数里不能有空格：$arg（自由文本请走标准输入）" >&2; exit 1 ;; esac
+done
+# Without stdin of its own (a TTY), send none, so a command that reads it does not wait for the keyboard.
+[ -t 0 ] && exec < /dev/null
+exec ssh -i "${CCBOT_KEY:-$HOME/.ssh/ccbot_grok}" -p "${CCBOT_PORT:-22}" \
+  -o BatchMode=yes -o IdentitiesOnly=yes -o ServerAliveInterval=30 -o ConnectTimeout=15 \
+  "$CCBOT_HOST" ccbot "$@"

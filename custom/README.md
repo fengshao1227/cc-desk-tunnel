@@ -18,6 +18,7 @@ Mac ── launchd: devlink-tunnel ── ssh -R 127.0.0.1:22022:127.0.0.1:22 �
 | `server/sync-project-map` | 服务器 `~/.local/bin` | 定时汇总各台 Mac 的 `projects.conf`，生成 `CCDT_PROJECT_MAP` 用的映射表 |
 | `mac/gui-helper.plist.in` + `mac/gui-helper-relay` | Mac | 让 launchd 在图形会话里拉起需要录屏或辅助功能权限的辅助程序，ssh 这边只做转发（见第 6 节） |
 | `server/computer-use-mac` | 服务器 `~/.local/bin` | 桌面控制 MCP（blade-computer-use）的包装脚本，可设置应用白名单 |
+| `ccbot/` | 服务器 `~/.local/bin`，Mac `~/.local/bin` | 让 Grok Bot 这类机器人新建、继续、审批、停止会话；机器人的 SSH 钥匙只能跑它（见 [ccbot/README.md](ccbot/README.md)） |
 
 ## 1. 服务器：隧道专用账号
 
