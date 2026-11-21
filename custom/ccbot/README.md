@@ -46,3 +46,18 @@ node --test custom/ccbot/test/*.test.mjs
 
 用到服务端内部的两处约定，升级上游后要复核：`sessions`/`events` 两张表的结构，和
 `<data>/native/<root>` 作为会话工作目录（`apps/server/src/claude.ts` 的 `nativeDirectory`）。
+
+## 设计取舍
+
+- **不改服务端**：改服务端要重启，重启会结束所有正在跑的会话，合并上游也会多出冲突。ccbot 只是又一个客户端。
+- **读库、写协议**：等结果要反复看状态，直接只读查 SQLite 最简单；改动一律走协议，所以审批、停止、标题这些都和 GUI 一致，也不会和服务端抢写数据库。
+- **服务端会话加项目链接**：服务端会话不依赖任何一台 Mac 在线（设备会话要设备的执行通道），链接到项目文件夹后又有项目规则和记忆，代码改由服务器上的 Claude 经 SSH 去 Mac。
+- **SSH 强制命令，而不是开 HTTP 接口**：不新开端口，认证就是 SSH 钥匙，按机器分钥匙、按行撤销，参数逐个白名单校验，自由文本只走标准输入。
+- **默认要审批**：机器人能被别人的消息影响，危险操作停下来，由人在 Grok 或网页上点同意。
+
+## 网页看板（同时上线）
+
+ccdt 自带的 Web 工作台经 Cloudflare Tunnel 对外：cloudflared 以服务用户运行，ingress 指向
+`https://127.0.0.1:<PROXY_PORT>`，`caPool` 用服务自签证书、`originServerName` 写证书名。
+[`server/ccdt-cf-tunnel`](../server/ccdt-cf-tunnel) 是守护脚本，crontab 里每 2 分钟和 `@reboot` 各跑一次。
+Web 访问设置里填上域名后，直接用 IP 访问网页会返回 404。适合 443 被别的程序占着、又没有 root 的机器。

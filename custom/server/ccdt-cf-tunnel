@@ -1,0 +1,10 @@
+#!/bin/sh
+# Keeps the Cloudflare tunnel of the CC Desk Tunnel web workbench (ccdt.fengshao1227.com) running.
+# cron runs it every 2 minutes and at boot; it starts cloudflared only when it is not already running.
+CF=$HOME/opt/cloudflared/cloudflared
+CFG=$HOME/.cloudflared/ccdt.yml
+LOG=$HOME/.local/state/ccdt-cf-tunnel.log
+[ -f "$CFG" ] || exit 0
+ps -eo args | awk -v c="$CF tunnel --config $CFG run" '$0 == c { found = 1 } END { exit !found }' && exit 0
+[ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 5000000 ] && mv "$LOG" "$LOG.1"
+cd / && setsid nohup "$CF" tunnel --config "$CFG" run >> "$LOG" 2>&1 < /dev/null &
