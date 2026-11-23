@@ -14,6 +14,14 @@
 
 对上游文件的改动只有 `store.ts`、`server.ts`、`native-terminal.ts`、`claude.ts` 里的十几行接入代码，合并上游新版本时冲突很少。测试在 `apps/server/test/customizations.test.ts`。
 
+另有一处修复（不是开关，默认生效，2026-11-23）：一台设备常同时有几条连接（窗口、终端），每条连接的主机密钥和登录密钥都不同，
+上游的 `Door` 只写当前那条的钥匙并在连接来去时切换，切换瞬间的 `ssh` 会报 “REMOTE HOST IDENTIFICATION HAS CHANGED” 或
+“Permission denied (publickey)”。本 fork 让 `Door` 同时列出该设备所有在线连接的主机密钥与登录私钥（`identity-<连接id>`，
+断开即删），并让会话的 `ssh`/`scp`/`sftp` 包装脚本在握手期的这三种报错时最多重试 3 次、间隔 2 秒（此时远端未执行、标准输入未读；
+标准输入是终端时不包装）。代码在 `apps/server/src/tunnel.ts`（`sshConfig`、`Door.use`、`sessionSshWrapper`）与
+`server.ts`（`readyTunnels`、`adopt`/`release`），测试在 `apps/server/test/tunnel.test.ts`。合并上游时留意这两个文件。
+注意：一条连接断开时，正在它上面跑的长命令仍会断（SSH 无法续接），长任务请在设备上脱离会话运行。
+
 ## 部署与周边
 
 - [deploy/native/](deploy/native/README.md)：不用 Docker 的原生部署（systemd），包括 CentOS 7 这类老系统；`install.sh` 用于首次安装，`upgrade.sh` 用于升级和回滚。
