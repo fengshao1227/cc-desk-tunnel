@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync, renameSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { createServer } from 'node:net';
 import type { AddressInfo, Server, Socket } from 'node:net';
 import { delimiter, join } from 'node:path';
@@ -58,14 +58,38 @@ export function sessionSsh(dataDir: string, sessionId: string, ssh: SshConnectio
     `Include ${JSON.stringify(ssh.configPath)}\nHost * !device !device-*\n  Include ~/.ssh/config /etc/ssh/ssh_config\n`,
     0o600,
   );
-  const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
   for (const name of ['ssh', 'scp', 'sftp'])
-    write(
-      join(bin, name),
-      `#!/bin/sh\nexec ${quote(program(name))} -F ${quote(configPath)} "$@"\n`,
-      0o700,
-    );
+    write(join(bin, name), sessionSshWrapper(program(name), configPath), 0o700);
   return { configPath, bin };
+}
+// What a session's `ssh`, `scp` and `sftp` are. Each device connection has keys of its own, and the door moves
+// to a newer connection when one is ready (see `Door`): a command whose `ssh` read the keys just before is then
+// answered with ones it does not have, and fails with a changed host key or a refused sign-in key. That happens
+// while connecting, before the device runs anything and before `ssh` reads standard input, so the same command
+// is made again once the door has written the new keys, at most three more times. A terminal's input is not
+// watched for this: an interactive `ssh` runs as it is.
+export const SSH_RETRY_PATTERN =
+  'REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed|Permission denied \\(publickey';
+export function sessionSshWrapper(program: string, configPath: string, pauseSeconds = 2) {
+  const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+  return [
+    '#!/bin/sh',
+    `p=${quote(program)}`,
+    `c=${quote(configPath)}`,
+    '[ -t 0 ] && exec "$p" -F "$c" "$@"',
+    'e=$(mktemp "${TMPDIR:-/tmp}/cc-ssh.XXXXXX") || exec "$p" -F "$c" "$@"',
+    `trap 'rm -f "$e" "$e.s"' EXIT`,
+    'n=0',
+    'while :; do',
+    // Its errors still reach the caller as they come; a copy is kept to tell why it ended.
+    '  { { "$p" -F "$c" "$@"; echo $? >"$e.s"; } 2>&1 1>&3 3>&- | tee "$e" >&2; } 3>&1',
+    '  s=$(cat "$e.s" 2>/dev/null) || s=255',
+    `  [ "$s" = 255 ] && [ "$n" -lt 3 ] && grep -qE ${quote(SSH_RETRY_PATTERN)} "$e" || exit "$s"`,
+    '  n=$((n + 1))',
+    `  sleep ${pauseSeconds}`,
+    'done',
+    '',
+  ].join('\n');
 }
 // The program on this service's PATH, which a session's own come before.
 export function program(name: string) {
@@ -136,19 +160,23 @@ export function sshConfig(
   directory: string,
   port: number,
   username: string,
-  hostPublicKey: string,
+  // One key, or the keys of every connection a door may hand a command to: see `Door`.
+  hostPublicKey: string | readonly string[],
   platform = process.platform,
   // Longer where a connection may first wait for the device to come back: see `Door`.
   connectSeconds = 15,
   // The system of the device and its shells, which decide what its scripts are run by.
   device: DevicePlatform = 'win32',
   shells: DeviceShell[] = [systemShell(device)],
+  // The sign-in keys `ssh` offers, in order; the device accepts the one of the connection that carries it.
+  identities: readonly string[] = [join(directory, 'identity')],
 ) {
   if (directory.includes('\n') || directory.includes('"'))
     throw new Error('Unsupported data directory');
   const shared = sharedConnectionPath(directory, platform);
+  const hostKeys = typeof hostPublicKey === 'string' ? [hostPublicKey] : hostPublicKey;
   return {
-    knownHosts: `[127.0.0.1]:${port} ${hostPublicKey}\n`,
+    knownHosts: hostKeys.map((key) => `[127.0.0.1]:${port} ${key}\n`).join(''),
     config: [
       // The same computer under a name for each of its shells, which takes a script in that shell instead of a
       // command. `ssh` reads % in this option as its own, so the device's variables are written with two.
@@ -161,7 +189,7 @@ export function sshConfig(
       '  HostName 127.0.0.1',
       `  Port ${port}`,
       `  User ${JSON.stringify(username)}`,
-      `  IdentityFile "${join(directory, 'identity')}"`,
+      ...identities.map((identity) => `  IdentityFile "${identity}"`),
       `  UserKnownHostsFile "${join(directory, 'known_hosts')}"`,
       '  IdentitiesOnly yes',
       '  BatchMode yes',
@@ -364,6 +392,8 @@ export class Door {
   private holdMs: number;
   private listener?: Server;
   private tunnel?: Tunnel;
+  // Every ready tunnel of the device, whose keys the files here list: see `use`.
+  private live: Tunnel[] = [];
   private held = new Map<Socket, NodeJS.Timeout>();
   private closed = false;
   constructor(options: TunnelOptions, dataDir: string, device: string) {
@@ -400,22 +430,36 @@ export class Door {
       });
     }
   }
-  // The tunnel that carries the device's commands from now on, or none while the device is away. Its keys
-  // replace the ones here; SSH connections that were waiting go to it.
-  use(tunnel: Tunnel | undefined) {
-    if (this.closed || tunnel === this.tunnel) return;
+  // The tunnel that carries the device's commands from now on, or none while the device is away, and the other
+  // ready tunnels of the same device. A computer often has several connections at once (a window, a terminal),
+  // each with keys of its own, and the door moves between them as they come and go; the files here list the
+  // keys of all of them, so a command whose `ssh` read them before a move is still answered with keys it has.
+  // SSH connections that were waiting go to the tunnel in use.
+  use(tunnel: Tunnel | undefined, others: readonly (Tunnel | undefined)[] = []) {
+    if (this.closed) return;
+    const live = [...new Set([tunnel, ...others])].filter(
+      (one): one is Tunnel => !!one?.credentials,
+    );
+    const same =
+      live.length === this.live.length && live.every((one, index) => one === this.live[index]);
+    if (tunnel === this.tunnel && same) return;
     this.tunnel = tunnel;
+    // While the device is away the files of its last tunnels stay: nothing newer is known.
     if (!tunnel?.credentials) return;
-    const { username, hostPublicKey, privateKey } = tunnel.credentials;
+    this.live = live;
+    const { username, privateKey } = tunnel.credentials;
+    const extra = live.filter((one) => one !== tunnel);
+    const identityOf = (one: Tunnel) => join(this.directory, `identity-${one.id}`);
     const files = sshConfig(
       this.directory,
       this.port,
       username,
-      hostPublicKey,
+      live.map((one) => one.credentials!.hostPublicKey),
       process.platform,
       Math.ceil(this.holdMs / 1000) + 15,
       tunnel.platform,
       tunnel.shells,
+      [join(this.directory, 'identity'), ...extra.map(identityOf)],
     );
     const write = (name: string, text: string) => {
       const next = join(this.directory, `${name}.${randomBytes(6).toString('hex')}`);
@@ -423,8 +467,14 @@ export class Door {
       renameSync(next, join(this.directory, name));
     };
     write('identity', privateKey);
+    for (const one of extra) write(`identity-${one.id}`, one.credentials!.privateKey);
+    // Keys of tunnels that are gone are dropped once the configuration no longer names them.
+    const kept = new Set(extra.map((one) => `identity-${one.id}`));
     write('known_hosts', files.knownHosts);
     write('ssh_config', files.config);
+    for (const name of readdirSync(this.directory))
+      if (/^identity-[^.]+$/.test(name) && !kept.has(name))
+        rmSync(join(this.directory, name), { force: true });
     this.ssh = { configPath: join(this.directory, 'ssh_config') };
     for (const [socket, timer] of this.held) {
       clearTimeout(timer);
@@ -434,6 +484,10 @@ export class Door {
   }
   uses(tunnel: Tunnel | undefined) {
     return this.tunnel === tunnel;
+  }
+  // The tunnel in use, if any.
+  get current() {
+    return this.tunnel;
   }
   // Whether a command reaches the device now, rather than waiting for it to come back.
   get ready() {

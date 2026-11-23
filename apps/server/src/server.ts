@@ -2144,8 +2144,12 @@ export function createProxyServer(options: ServerOptions) {
     const seat = seats.get(peer.device.id);
     if (!seat?.door) return;
     await seat.opening;
-    if (peers.has(peer) && seat.peers.has(peer)) seat.door.use(peer.tunnel);
+    if (peers.has(peer) && seat.peers.has(peer)) seat.door.use(peer.tunnel, readyTunnels(seat));
     announce();
+  }
+  // The tunnels of a computer's connections that are ready to carry commands, oldest first.
+  function readyTunnels(seat: Seat) {
+    return [...seat.peers].flatMap((other) => (other.tunnel?.ssh ? [other.tunnel] : []));
   }
   // Nothing more is kept for a computer: its runs end and its door closes.
   function vacate(seat: Seat, reason: string) {
@@ -2178,8 +2182,11 @@ export function createProxyServer(options: ServerOptions) {
       }
     const seat = peer.device && seats.get(peer.device.id);
     if (seat?.peers.delete(peer)) {
-      if (seat.door?.uses(peer.tunnel))
-        seat.door.use([...seat.peers].findLast((other) => other.tunnel?.ssh)?.tunnel);
+      if (seat.door) {
+        const ready = readyTunnels(seat);
+        // The newest ready one takes over from a tunnel that went; otherwise the one in use stays, without its keys.
+        seat.door.use(seat.door.uses(peer.tunnel) ? ready.at(-1) : seat.door.current, ready);
+      }
       if (!seat.peers.size) {
         const waiting =
           [...runs.values()].some((run) => run.device === seat.device) ||

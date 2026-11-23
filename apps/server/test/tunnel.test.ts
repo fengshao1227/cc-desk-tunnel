@@ -1,7 +1,15 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { Door, shellCommand, shellsOf, sshConfig, sessionSsh, Tunnel } from '../src/tunnel.ts';
-import { execFileSync } from 'node:child_process';
+import {
+  Door,
+  shellCommand,
+  shellsOf,
+  sshConfig,
+  sessionSsh,
+  sessionSshWrapper,
+  Tunnel,
+} from '../src/tunnel.ts';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -211,13 +219,12 @@ test('a session reaches its device by ssh, scp and sftp of its own, and every ot
     readFileSync(ssh.configPath, 'utf8'),
     `Include ${JSON.stringify(door)}\nHost * !device !device-*\n  Include ~/.ssh/config /etc/ssh/ssh_config\n`,
   );
-  for (const name of ['ssh', 'scp', 'sftp'])
-    assert.match(
-      readFileSync(join(ssh.bin!, name), 'utf8'),
-      new RegExp(
-        `^#!/bin/sh\\nexec '[^']*${name}' -F '${ssh.configPath.replaceAll('\\', '\\\\')}' "\\$@"\\n$`,
-      ),
-    );
+  for (const name of ['ssh', 'scp', 'sftp']) {
+    const wrapper = readFileSync(join(ssh.bin!, name), 'utf8');
+    assert.match(wrapper, /^#!\/bin\/sh\n/);
+    assert.match(wrapper, new RegExp(`^p='[^']*${name}'$`, 'm'));
+    assert.ok(wrapper.includes(`c='${ssh.configPath}'`));
+  }
   assert.notEqual(sessionSsh(directory, randomUUID(), { configPath: door }).bin, ssh.bin);
   // The session's own come first on the PATH of its CLI.
   assert.deepEqual(sshPath(ssh, '/usr/bin'), {
@@ -415,6 +422,61 @@ test('closing the tunnel ends waiting and joined SSH connections, their channels
   assert.equal(device.tunnel.close(), device.tunnel.close());
 });
 
+test('a session wrapper makes a command again when the door answered with keys ssh did not have yet', (t) => {
+  if (process.platform === 'win32') return;
+  const directory = mkdtempSync(join(tmpdir(), 'claude-ssh-retry-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const count = join(directory, 'count');
+  // Fails as given in FAIL for the first FAILS runs, then echoes its input and arguments and exits with CODE.
+  const fake = join(directory, 'fake-ssh');
+  writeFileSync(
+    fake,
+    [
+      '#!/bin/sh',
+      `n=$(cat '${count}' 2>/dev/null || echo 0); echo $((n + 1)) > '${count}'`,
+      'if [ "$n" -lt "$FAILS" ]; then echo "$FAIL" >&2; exit 255; fi',
+      'printf "args:%s|" "$@"; cat; echo "warn" >&2; exit "$CODE"',
+      '',
+    ].join('\n'),
+    { mode: 0o700 },
+  );
+  const wrapper = join(directory, 'ssh');
+  writeFileSync(wrapper, sessionSshWrapper(fake, join(directory, 'config'), 0), { mode: 0o700 });
+  const run = (env: Record<string, string>) => {
+    rmSync(count, { force: true });
+    const result = spawnSync(wrapper, ['device', 'x y'], {
+      input: 'script',
+      encoding: 'utf8',
+      env: { ...process.env, CODE: '0', FAILS: '0', FAIL: '', ...env },
+    });
+    return { ...result, runs: Number(readFileSync(count, 'utf8')) };
+  };
+  // A changed host key or a refused sign-in key: made again, input and arguments as they were.
+  for (const fail of [
+    '@@@@@@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@@@@@@',
+    'Host key verification failed.',
+    'device@127.0.0.1: Permission denied (publickey).',
+  ]) {
+    const ok = run({ FAILS: '2', FAIL: fail, CODE: '7' });
+    assert.equal(ok.runs, 3);
+    assert.equal(ok.status, 7);
+    assert.equal(
+      ok.stdout,
+      'args:-F|args:' + join(directory, 'config') + '|args:device|args:x y|script',
+    );
+    assert.match(ok.stderr, /warn/);
+  }
+  // At most three more times.
+  const stuck = run({ FAILS: '9', FAIL: 'Host key verification failed.' });
+  assert.equal(stuck.runs, 4);
+  assert.equal(stuck.status, 255);
+  // Anything else ends it at once: a command of the device that failed, or a connection that broke.
+  assert.equal(run({ FAILS: '1', FAIL: 'Connection closed by remote host' }).runs, 1);
+  const failed = run({ CODE: '255' });
+  assert.equal(failed.runs, 1);
+  assert.equal(failed.status, 255);
+});
+
 test('OpenSSH parses a username with spaces or a domain as one User value', (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'claude-ssh-user-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -491,6 +553,52 @@ test('a device keeps one door: commands begun while it is away wait for its next
   const began = Date.now();
   await closed(lost);
   assert.ok(Date.now() - began >= 300);
+});
+test('a door lists the keys of every ready tunnel of its device, so a move between them breaks no command', async (t) => {
+  const first = await harness(t);
+  const second = await harness(t);
+  const directory = mkdtempSync(join(tmpdir(), 'claude-door-keys-'));
+  const door = new Door({ holdMs: 400 }, directory, randomUUID());
+  await door.start();
+  t.after(async () => {
+    await door.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const credentials = (name: string) => ({
+    type: 'tunnel.credentials' as const,
+    connectionId: randomUUID(),
+    username: 'tester',
+    hostPublicKey: `ssh-ed25519 ${name}`,
+    privateKey: `private ${name}\n`,
+    shells: ['zsh' as const],
+  });
+  first.tunnel.credentials = credentials('first');
+  second.tunnel.credentials = credentials('second');
+  const knownHosts = () => readFileSync(join(door.directory, 'known_hosts'), 'utf8');
+  const config = () => readFileSync(join(door.directory, 'ssh_config'), 'utf8');
+  const firstIdentity = join(door.directory, `identity-${first.tunnel.id}`);
+
+  door.use(first.tunnel, [first.tunnel]);
+  assert.equal(knownHosts().trim().split('\n').length, 1);
+  // A second connection of the computer is ready and takes over: both keys are known, the newer one first.
+  door.use(second.tunnel, [first.tunnel, second.tunnel]);
+  assert.match(knownHosts(), /second/);
+  assert.match(knownHosts(), /first/);
+  assert.equal(readFileSync(join(door.directory, 'identity'), 'utf8'), 'private second\n');
+  assert.equal(readFileSync(firstIdentity, 'utf8'), 'private first\n');
+  const offered = [...config().matchAll(/IdentityFile "([^"]+)"/g)].map((match) => match[1]);
+  assert.deepEqual(offered, [join(door.directory, 'identity'), firstIdentity]);
+  assert.ok(door.uses(second.tunnel));
+  assert.equal(door.current, second.tunnel);
+  // The first connection goes: its keys go with it.
+  door.use(second.tunnel, [second.tunnel]);
+  assert.doesNotMatch(knownHosts(), /first/);
+  assert.equal(existsSync(firstIdentity), false);
+  assert.doesNotMatch(config(), /identity-/);
+  // The same tunnels again change nothing.
+  const before = config();
+  door.use(second.tunnel, [second.tunnel]);
+  assert.equal(config(), before);
 });
 test('the prompt lets the model look at a picture of the device by copying that one file here', () => {
   const prompt = remotePrompt('D:\\work', 'session', windows);
